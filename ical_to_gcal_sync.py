@@ -11,6 +11,7 @@ import googleapiclient
 import arrow
 from googleapiclient import errors
 from icalevents.icalevents import events
+from icalevents.icalparser import Event
 from dateutil.tz import gettz
 
 from datetime import datetime, timezone, timedelta
@@ -18,13 +19,14 @@ from datetime import datetime, timezone, timedelta
 from auth import auth_with_calendar_api
 from pathlib import Path
 from httplib2 import Http
+from slack import send_slack_status_notification
 
 config = {}
 config_path = os.environ.get("CONFIG_PATH", "config.py")
 exec(Path(config_path).read_text(), config)
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 if config.get("LOGFILE", None):
     handler = logging.FileHandler(filename=config["LOGFILE"], mode="a")
 else:
@@ -47,20 +49,13 @@ def get_current_events_from_files(path):
 
     event_ics = glob(join(path, "*.ics"))
 
-    logger.debug(
-        "> Found {} local .ics files in {}".format(len(event_ics), join(path, "*.ics"))
-    )
     if len(event_ics) > 0:
         ics = event_ics[0]
-        logger.debug("> Loading file {}".format(ics))
         cal = get_current_events(feed_url_or_path=ics, files=True)
-        logger.debug("> Found {} new events".format(len(cal)))
         for ics in event_ics[1:]:
-            logger.debug("> Loading file {}".format(ics))
             evt = get_current_events(feed_url_or_path=ics, files=True)
             if len(evt) > 0:
                 cal.extend(evt)
-            logger.debug("> Found {} new events".format(len(evt)))
         return cal
     else:
         return None
@@ -130,7 +125,27 @@ def get_current_events(feed_url_or_path, files):
         logger.error("> Error retrieving iCal data ({})".format(e))
         return None
 
-    return cal
+    # Process multi-day events
+    processed_events = []
+    for ev in cal:
+        # Handle timezone
+        if ev.start.tzinfo is None:
+            ev.start = ev.start.replace(tzinfo=timezone.utc)
+        if ev.end is not None and ev.end.tzinfo is None:
+            ev.end = ev.end.replace(tzinfo=timezone.utc)
+
+        # Try to parse multi-day events
+        day_events = parse_multi_day_event(ev)
+        if day_events:
+            logger.debug(
+                f"Splitting multi-day event {ev.summary} into {len(day_events)} day events"
+            )
+            processed_events.extend(day_events)
+        else:
+            processed_events.append(ev)
+
+    logger.debug(f"Processed {len(processed_events)} events total")
+    return processed_events
 
 
 def get_gcal_events(calendar_id, service, from_time=None):
@@ -143,8 +158,6 @@ def get_gcal_events(calendar_id, service, from_time=None):
     # The list() method returns a dict containing various metadata along with the actual calendar entries (if any).
     # It is not guaranteed to return all available events in a single call, and so may need called multiple times
     # until it indicates no more events are available, signalled by the absence of "nextPageToken" in the result dict
-
-    logger.debug("Retrieving Google Calendar events")
 
     # make an initial call, if this returns all events we don't need to do anything else,,,
     events_result = (
@@ -186,11 +199,6 @@ def get_gcal_events(calendar_id, service, from_time=None):
         )
         newevents = events_result.get("items", [])
         events.extend(newevents)
-        logger.debug(
-            "> Found {:d} events on new page, {:d} total".format(
-                len(newevents), len(events)
-            )
-        )
 
     logger.info(
         "> Found {:d} upcoming events in Google Calendar (multi page)".format(
@@ -229,6 +237,105 @@ def create_id(uid, begintime, endtime, prefix=""):
         + str(arrow.get(begintime).int_timestamp)
         + str(arrow.get(endtime).int_timestamp)
     )
+
+
+def parse_multi_day_event(ev: Event) -> list[Event]:
+    """Parse a multi-day event and split it into individual day events.
+
+    Args:
+        ev: The original multi-day event
+
+    Returns:
+        A list of individual day events, or None if the event couldn't be parsed
+    """
+    if not ev.end or (ev.end - ev.start).days <= 0:
+        return None
+
+    if not ev.description:
+        return None
+
+    # Extract DPXX Report sections
+    dp_pattern = r"\* DP(\d+) Report: (\w+) (\d+):(\d+) Release: (\w+) (\d+):(\d+)(.*?)(?=\* DP\d+ Report:|$)"
+    dp_sections = re.findall(dp_pattern, ev.description, re.DOTALL)
+
+    if not dp_sections:
+        return None
+
+    day_events = []
+    # Create a mapping of month abbreviations to month numbers
+    month_map = {
+        "Jan": 1,
+        "Feb": 2,
+        "Mar": 3,
+        "Apr": 4,
+        "May": 5,
+        "Jun": 6,
+        "Jul": 7,
+        "Aug": 8,
+        "Sep": 9,
+        "Oct": 10,
+        "Nov": 11,
+        "Dec": 12,
+    }
+
+    for (
+        dp_num,
+        dep_airport,
+        dep_hour,
+        dep_min,
+        arr_airport,
+        arr_hour,
+        arr_min,
+        section_text,
+    ) in dp_sections:
+        # Extract flights from this section
+        flight_pattern = r"Flight Number: UA (\d+)\s+(\w+)\s+(\w+)\s+(\d+):(\d+)\s+(\w+)\s+(\w+)\s+(\d+):(\d+)"
+        flights = re.findall(flight_pattern, section_text)
+
+        if not flights:
+            continue
+
+        # Extract the date from the first flight's departure
+        first_flight = flights[0]
+        month_abbr = first_flight[2][:3]  # Get first 3 chars for month abbreviation
+        day = int(first_flight[2][3:])  # Get the day number
+        month = month_map[month_abbr]
+
+        # Get the year from the event's start date
+        year = ev.start.year
+
+        # Create the date for this day's events
+        current_date = datetime(year, month, day).date()
+
+        # Create a list of unique airports in order for this day's flights
+        day_airports = []
+        last_airport = None
+
+        for flight in flights:
+            # Add departure airport if it's different from the last one
+            if flight[1] != last_airport:
+                day_airports.append(flight[1])
+                last_airport = flight[1]
+            # Add arrival airport if it's different from the last one
+            if flight[5] != last_airport:
+                day_airports.append(flight[5])
+                last_airport = flight[5]
+
+        if day_airports:
+            # Create a new event for this day
+            day_event = Event()
+            day_event.uid = f"{ev.uid}_DP{dp_num}"
+            day_event.start = datetime.combine(current_date, datetime.min.time())
+            day_event.end = datetime.combine(
+                current_date, datetime.min.time()
+            ) + timedelta(days=1)
+
+            # Set title with airports for this day's flights
+            day_event.summary = " → ".join(day_airports)
+            day_event.description = ev.description
+            day_events.append(day_event)
+
+    return day_events
 
 
 if __name__ == "__main__":
@@ -277,13 +384,6 @@ if __name__ == "__main__":
         ical_events = {}
 
         for ev in ical_cal:
-            # explicitly set any events with no timezone to use UTC (icalevents
-            # doesn't seem to do this automatically like ics.py)
-            if ev.start.tzinfo is None:
-                ev.start = ev.start.replace(tzinfo=timezone.utc)
-            if ev.end is not None and ev.end.tzinfo is None:
-                ev.end = ev.end.replace(tzinfo=timezone.utc)
-
             try:
                 if "EVENT_PREPROCESSOR" in config:
                     keep = config["EVENT_PREPROCESSOR"](ev)
@@ -312,6 +412,14 @@ if __name__ == "__main__":
         logger.info("> Processing Google Calendar events...")
         gcal_event_ids = [ev["id"] for ev in gcal_events]
 
+        # Track sync statistics
+        sync_stats = {
+            "events_added": 0,
+            "events_updated": 0,
+            "events_deleted": 0,
+            "errors": 0,
+        }
+
         # first check the set of Google Calendar events against the list of iCal
         # events. Any events in Google Calendar that are no longer in iCal feed
         # get deleted. Any events still present but with changed start/end times
@@ -321,12 +429,6 @@ if __name__ == "__main__":
 
             if eid not in ical_events:
                 # if a gcal event has been deleted from iCal, also delete it from gcal.
-                # Apparently calling delete() only marks an event as "deleted" but doesn't
-                # remove it from the calendar, so it will continue to stick around.
-                # If you keep seeing messages about events being deleted here, you can
-                # try going to the Google Calendar site, opening the options menu for
-                # your calendar, selecting "View bin" and then clicking "Empty bin
-                # now" to completely delete these events.
                 try:
                     # already marked as deleted, so it's in the "trash" or "bin"
                     if gcal_event["status"] == "cancelled":
@@ -340,6 +442,7 @@ if __name__ == "__main__":
                     service.events().delete(
                         calendarId=feed["destination"], eventId=eid
                     ).execute()
+                    sync_stats["events_deleted"] += 1
                     time.sleep(config["API_SLEEP_TIME"])
                 except googleapiclient.errors.HttpError:
                     pass  # event already marked as deleted
@@ -400,7 +503,7 @@ if __name__ == "__main__":
                     or locs_differ
                     or descs_differ
                 ):
-                    logger.info(
+                    logger.debug(
                         '> Updating event "{}" due to changes: {}'.format(
                             log_name, ", ".join(changes)
                         )
@@ -438,6 +541,7 @@ if __name__ == "__main__":
                     service.events().update(
                         calendarId=feed["destination"], eventId=eid, body=gcal_event
                     ).execute()
+                    sync_stats["events_updated"] += 1
                     time.sleep(config["API_SLEEP_TIME"])
 
         # now add any iCal events not already in the Google Calendar
@@ -495,10 +599,12 @@ if __name__ == "__main__":
                     service.events().insert(
                         calendarId=feed["destination"], body=gcal_event
                     ).execute()
+                    sync_stats["events_added"] += 1
                 except Exception as ei:
                     logger.warning(
                         "Error inserting: %s (%s)" % (gcal_event["id"], str(ei))
                     )
+                    sync_stats["errors"] += 1
                     time.sleep(config["API_SLEEP_TIME"])
                     try:
                         service.events().update(
@@ -506,7 +612,21 @@ if __name__ == "__main__":
                             eventId=gcal_event["id"],
                             body=gcal_event,
                         ).execute()
+                        sync_stats["events_updated"] += 1
                     except Exception as ex:
                         logger.error("Error updating: %s (%s)" % (gcal_event["id"], ex))
+                        sync_stats["errors"] += 1
 
         logger.info("> Processing of source %s completed" % feed["source"])
+
+        # Send Slack notification with sync statistics
+        try:
+            total_events = (
+                sync_stats["events_added"]
+                + sync_stats["events_updated"]
+                + sync_stats["events_deleted"]
+            )
+            success = sync_stats["errors"] == 0
+            send_slack_status_notification(sync_stats, total_events, success)
+        except Exception as e:
+            logger.error(f"Failed to send Slack notification: {str(e)}")
