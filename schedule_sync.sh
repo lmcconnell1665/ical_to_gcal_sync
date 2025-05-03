@@ -27,3 +27,4 @@ else
   echo "Python script failed with exit code $EXIT_CODE. Check $LOG_FILE for details."
   echo "Schedule sync finished with errors at $END_TIMESTAMP"
   exit $EXIT_CODE
+fi
